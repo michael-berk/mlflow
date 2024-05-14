@@ -19,7 +19,6 @@ from mlflow.utils.environment import _mlflow_conda_env
 )
 def test_log_and_load_single_index_pyfunc(request, tmp_path, index_fixture, should_start_run):
     try:
-        # with settings_context(do_embed=True, do_llm=True):
         if should_start_run:
             mlflow.start_run()
         artifact_path = "index"

@@ -187,9 +187,7 @@ def test_sanitize_kwargs_extra_kwargs(embed_model):
 def test_object_to_dict_no_required_param(llm):
     o = llm
     result = object_to_dict(o)
-    assert (
-        result["object_constructor"] == "llama_index.core.llms.mock.MockLLM"
-    )  # Expected import path
+    assert result["object_constructor"] == "llama_index.core.llms.mock.MockLLM"
     expected_kwargs = {k: v for k, v in o.to_dict().items() if k != "class_name"}
     assert result["object_kwargs"] == expected_kwargs
 
@@ -199,7 +197,7 @@ def test_object_to_dict_one_required_param(embed_model):
     result = object_to_dict(o)
     assert (
         result["object_constructor"] == "llama_index.core.embeddings.mock_embed_model.MockEmbedding"
-    )  # Expected import path
+    )
     expected_kwargs = {k: v for k, v in o.to_dict().items() if k != "class_name"}
     assert result["object_kwargs"] == expected_kwargs
 
