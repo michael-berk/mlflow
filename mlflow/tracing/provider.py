@@ -281,6 +281,7 @@ def _setup_tracer_provider(disabled=False):
     tracer_provider = TracerProvider()
     tracer_provider.add_span_processor(processor)
     _MLFLOW_TRACER_PROVIDER = tracer_provider
+    assert _MLFLOW_TRACER_PROVIDER
 
     from mlflow.tracing.utils.warning import suppress_warning
 
