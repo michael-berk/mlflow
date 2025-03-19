@@ -216,9 +216,9 @@ const sidebars: SidebarsConfig = {
               ]
             },
             {
-              type: 'doc',
+              type: 'link',
               label: 'Prompt Engineering',
-              id: 'llms/prompt-engineering/index',
+              href: '/prompts',
             },
           ],
           link: {
@@ -343,6 +343,33 @@ const sidebars: SidebarsConfig = {
           ],
         },
         {
+          type: 'category',
+          label: 'MLflow Prompts 🆕',
+          items: [
+            {
+              type: 'doc',
+              label: 'Overview',
+              id: 'prompts/index',
+            },
+            {
+              type: 'doc',
+              id: 'prompts/cm',
+            },
+            {
+              type: 'doc',
+              id: 'prompts/evaluate',
+            },
+            {
+              type: 'doc',
+              id: 'prompts/run-and-model',
+            },
+            {
+              type: 'doc',
+              id: 'llms/prompt-engineering/index',
+            }
+          ]
+        },
+        {
           type: 'doc',
           id: 'recipes/index'
         }
@@ -463,12 +490,12 @@ const sidebars: SidebarsConfig = {
         {
           type: 'link',
           label: 'R API',
-          href: `${apiReferencePrefix()}api_reference/R-api/index.html`,
+          href: `${apiReferencePrefix()}api_reference/R-api.html`,
         },
         {
           type: 'link',
           label: 'REST API',
-          href: `${apiReferencePrefix()}api_reference/rest-api/index.html`,
+          href: `${apiReferencePrefix()}api_reference/rest-api.html`,
         },
         {
           type: 'link',

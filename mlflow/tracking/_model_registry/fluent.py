@@ -11,6 +11,7 @@ from mlflow.store.model_registry import (
 )
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 from mlflow.tracking.client import MlflowClient
+from mlflow.tracking.fluent import active_run
 from mlflow.utils import get_results_from_paginated_fn
 from mlflow.utils.annotations import experimental
 from mlflow.utils.logging_utils import eprint
@@ -332,7 +333,8 @@ def search_model_versions(
 def register_prompt(
     name: str,
     template: str,
-    description: Optional[str] = None,
+    commit_message: Optional[str] = None,
+    version_metadata: Optional[dict[str, str]] = None,
     tags: Optional[dict[str, str]] = None,
 ) -> Prompt:
     """
@@ -345,6 +347,39 @@ def register_prompt(
     If there is no registered prompt with the given name, a new prompt will be created.
     Otherwise, a new version of the existing prompt will be created.
 
+
+    Args:
+        name: The name of the prompt.
+        template: The template text of the prompt. It can contain variables enclosed in
+            double curly braces, e.g. {variable}, which will be replaced with actual values
+            by the `format` method.
+
+            .. note::
+
+                If you want to use the prompt with a framework that uses single curly braces
+                e.g. LangChain, you can use the `to_single_brace_format` method to convert the
+                loaded prompt to a format that uses single curly braces.
+
+                .. code-block:: python
+
+                    prompt = client.load_prompt("my_prompt")
+                    langchain_format = prompt.to_single_brace_format()
+
+        commit_message: A message describing the changes made to the prompt, similar to a
+            Git commit message. Optional.
+        version_metadata: A dictionary of metadata associated with the **prompt version**.
+            This is useful for storing version-specific information, such as the author of
+            the changes. Optional.
+        tags: A dictionary of tags associated with the entire prompt. This is different from
+            the `version_metadata` as it is not tied to a specific version of the prompt,
+            but to the prompt as a whole. For example, you can use tags to add an application
+            name for which the prompt is created. Since the application uses the prompt in
+            multiple versions, it makes sense to use tags instead of version-specific metadata.
+            Optional.
+
+    Returns:
+        A :py:class:`Prompt <mlflow.entities.Prompt>` object that was created.
+
     Example:
 
     .. code-block:: python
@@ -354,7 +389,8 @@ def register_prompt(
         # Register a new prompt
         mlflow.register_prompt(
             name="my_prompt",
-            template="Respond to the user's message as a {style} AI.",
+            template="Respond to the user's message as a {{style}} AI.",
+            version_metadata={"author": "Alice"},
         )
 
         # Load the prompt from the registry
@@ -375,22 +411,17 @@ def register_prompt(
         # Update the prompt with a new version
         prompt = mlflow.register_prompt(
             name="my_prompt",
-            template="Respond to the user's message as a {style} AI. {greeting}",
+            template="Respond to the user's message as a {{style}} AI. {{greeting}}",
+            commit_message="Add a greeting to the prompt.",
+            version_metadata={"author": "Bob"},
         )
-
-    Args:
-        name: The name of the prompt.
-        template: The template text of the prompt. It can contain variables enclosed in
-            single curly braces, e.g. {variable}, which will be replaced with actual values
-            by the `format` method.
-        description: The description of the prompt. Optional.
-        tags: A dictionary of tags associated with the prompt. Optional.
-
-    Returns:
-        A :py:class:`Prompt <mlflow.entities.Prompt>` object that was created.
     """
     return MlflowClient().register_prompt(
-        name=name, template=template, description=description, tags=tags
+        name=name,
+        template=template,
+        commit_message=commit_message,
+        tags=tags,
+        version_metadata=version_metadata,
     )
 
 
@@ -401,6 +432,10 @@ def load_prompt(name_or_uri: str, version: Optional[int] = None) -> Prompt:
     Load a :py:class:`Prompt <mlflow.entities.Prompt>` from the MLflow Prompt Registry.
 
     The prompt can be specified by name and version, or by URI.
+
+    Args:
+        name_or_uri: The name of the prompt, or the URI in the format "prompts:/name/version".
+        version: The version of the prompt. If not specified, the latest version will be loaded.
 
     Example:
 
@@ -417,11 +452,18 @@ def load_prompt(name_or_uri: str, version: Optional[int] = None) -> Prompt:
         # Load a specific version of the prompt by URI
         prompt = mlflow.load_prompt(uri="prompts:/my_prompt/1")
 
-    Args:
-        name_or_uri: The name of the prompt, or the URI in the format "prompts:/name/version".
-        version: The version of the prompt. If not specified, the latest version will be loaded.
+        # Load a prompt version with an alias "production"
+        prompt = mlflow.load_prompt("prompts:/my_prompt@production")
+
     """
-    return MlflowClient().load_prompt(name_or_uri=name_or_uri, version=version)
+    client = MlflowClient()
+    prompt = client.load_prompt(name_or_uri=name_or_uri, version=version)
+
+    # If there is an active MLflow run, associate the prompt with the run
+    if run := active_run():
+        client.log_prompt(run.info.run_id, f"prompts:/{prompt.name}/{prompt.version}")
+
+    return prompt
 
 
 @experimental
@@ -435,3 +477,49 @@ def delete_prompt(name: str, version: int) -> Prompt:
         version: The version of the prompt to delete.
     """
     return MlflowClient().delete_prompt(name=name, version=version)
+
+
+@experimental
+@require_prompt_registry
+def set_prompt_alias(name: str, alias: str, version: int) -> Prompt:
+    """
+    Set an alias for a :py:class:`Prompt <mlflow.entities.Prompt>` in the MLflow Prompt Registry.
+
+    Args:
+        name: The name of the prompt.
+        alias: The alias to set for the prompt.
+        version: The version of the prompt.
+
+    Example:
+
+    .. code-block:: python
+
+        import mlflow
+
+        # Set an alias for the prompt
+        mlflow.set_prompt_alias(name="my_prompt", version=1, alias="production")
+
+        # Load the prompt by alias (use "@" to specify the alias)
+        prompt = mlflow.load_prompt("prompts:/my_prompt@production")
+
+        # Switch the alias to a new version of the prompt
+        mlflow.set_prompt_alias(name="my_prompt", version=2, alias="production")
+
+        # Delete the alias
+        mlflow.delete_prompt_alias(name="my_prompt", alias="production")
+    """
+
+    return MlflowClient().set_prompt_alias(name=name, version=version, alias=alias)
+
+
+@experimental
+@require_prompt_registry
+def delete_prompt_alias(name: str, alias: str) -> Prompt:
+    """
+    Delete an alias for a :py:class:`Prompt <mlflow.entities.Prompt>` in the MLflow Prompt Registry.
+
+    Args:
+        name: The name of the prompt.
+        alias: The alias to delete for the prompt.
+    """
+    return MlflowClient().delete_prompt_alias(name=name, alias=alias)

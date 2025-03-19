@@ -46,22 +46,26 @@ from mlflow.entities.assessment import (
 from mlflow.entities.assessment_source import AssessmentSource
 from mlflow.entities.model_registry import ModelVersion, Prompt, RegisteredModel
 from mlflow.entities.model_registry.model_version_stages import ALL_STAGES
-from mlflow.entities.model_registry.prompt import (
-    IS_PROMPT_TAG_KEY,
-    PROMPT_ASSOCIATED_RUN_IDS_TAG_KEY,
-    PROMPT_TEXT_TAG_KEY,
-)
 from mlflow.entities.span import NO_OP_SPAN_REQUEST_ID, NoOpSpan, create_mlflow_span
 from mlflow.entities.trace_status import TraceStatus
 from mlflow.environment_variables import MLFLOW_ENABLE_ASYNC_LOGGING
 from mlflow.exceptions import MlflowException
-from mlflow.prompt.registry_utils import has_prompt_tag, parse_prompt_uri, require_prompt_registry
+from mlflow.prompt.constants import (
+    IS_PROMPT_TAG_KEY,
+    PROMPT_ASSOCIATED_RUN_IDS_TAG_KEY,
+    PROMPT_TEXT_TAG_KEY,
+)
+from mlflow.prompt.registry_utils import (
+    has_prompt_tag,
+    require_prompt_registry,
+    translate_prompt_exception,
+    validate_prompt_name,
+)
 from mlflow.protos.databricks_pb2 import (
     BAD_REQUEST,
     FEATURE_DISABLED,
     INVALID_PARAMETER_VALUE,
     RESOURCE_DOES_NOT_EXIST,
-    ErrorCode,
 )
 from mlflow.store.artifact.utils.models import (
     get_model_name_and_version,
@@ -122,6 +126,13 @@ _STAGES_DEPRECATION_WARNING = (
     "deprecation of model registry stages, see our migration guide here: https://mlflow.org/docs/"
     "latest/model-registry.html#migrating-from-stages"
 )
+
+
+def _model_not_found(name: str) -> MlflowException:
+    return MlflowException(
+        f"Registered Model with name={name!r} not found.",
+        RESOURCE_DOES_NOT_EXIST,
+    )
 
 
 class MlflowClient:
@@ -410,12 +421,14 @@ class MlflowClient:
 
     @experimental
     @require_prompt_registry
+    @translate_prompt_exception
     def register_prompt(
         self,
         name: str,
         template: str,
-        description: Optional[str] = None,
-        tags: Optional[dict[str, Any]] = None,
+        commit_message: Optional[str] = None,
+        version_metadata: Optional[dict[str, str]] = None,
+        tags: Optional[dict[str, str]] = None,
     ) -> Prompt:
         """
         Register a new :py:class:`Prompt <mlflow.entities.Prompt>` in the MLflow Prompt Registry.
@@ -439,7 +452,8 @@ class MlflowClient:
             # Register a new prompt
             client.register_prompt(
                 name="my_prompt",
-                template="Respond to the user's message as a {style} AI.",
+                template="Respond to the user's message as a {{style}} AI.",
+                version_metadata={"author": "Alice"},
             )
 
             # Load the prompt from the registry
@@ -460,56 +474,87 @@ class MlflowClient:
             # Update the prompt with a new version
             prompt = client.register_prompt(
                 name="my_prompt",
-                template="Respond to the user's message as a {style} AI. {greeting}",
+                template="Respond to the user's message as a {{style}} AI. {{greeting}}",
+                commit_message="Add a greeting to the prompt.",
+                version_metadata={"author": "Bob"},
             )
 
         Args:
             name: The name of the prompt.
             template: The template text of the prompt. It can contain variables enclosed in
-                single curly braces, e.g. {variable}, which will be replaced with actual values
+                double curly braces, e.g. {{variable}}, which will be replaced with actual values
                 by the `format` method.
-            description: The description of the prompt. Optional.
-            tags: A dictionary of tags associated with the prompt. Optional.
+            commit_message: A message describing the changes made to the prompt, similar to a
+                Git commit message. Optional.
+            version_metadata: A dictionary of metadata associated with the **prompt version**.
+                This is useful for storing version-specific information, such as the author of
+                the changes. Optional.
+            tags: A dictionary of tags associated with the entire prompt. This is different from
+                the `version_metadata` as it is not tied to a specific version of the prompt,
+                but to the prompt as a whole. For example, you can use tags to add an application
+                name for which the prompt is created. Since the application uses the prompt in
+                multiple versions, it makes sense to use tags instead of version-specific metadata.
+                Optional.
 
         Returns:
             A :py:class:`Prompt <mlflow.entities.Prompt>` object that was created.
         """
         registry_client = self._get_registry_client()
 
+        validate_prompt_name(name)
+
+        is_new_prompt = False
+        rm = None
+        tags = tags or {}
         try:
             rm = registry_client.get_registered_model(name)
-
-            # Check if the registered model is a prompt
-            if not has_prompt_tag(rm._tags):
-                raise MlflowException(
-                    f"Model '{name}' exists with the same name. MLflow does not allow registering "
-                    "a prompt with the same name as an existing model. Please choose a different "
-                    "name for the prompt.",
-                    INVALID_PARAMETER_VALUE,
-                )
-
-        except MlflowException as e:
+        except MlflowException:
             # Create a new prompt (model) entry
-            if e.error_code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST):
-                registry_client.create_registered_model(
-                    name, description=description, tags={IS_PROMPT_TAG_KEY: "true"}
-                )
-            else:
-                raise
+            registry_client.create_registered_model(
+                name, description=commit_message, tags={IS_PROMPT_TAG_KEY: "true", **tags}
+            )
+            is_new_prompt = True
 
-        tags = tags or {}
-        tags.update({IS_PROMPT_TAG_KEY: "true", PROMPT_TEXT_TAG_KEY: template})
+        # Check if the registered model is a prompt
+        if rm and not has_prompt_tag(rm._tags):
+            raise MlflowException(
+                f"Model '{name}' exists with the same name. MLflow does not allow registering "
+                "a prompt with the same name as an existing model. Please choose a different "
+                "name for the prompt.",
+                INVALID_PARAMETER_VALUE,
+            )
 
-        mv: ModelVersion = registry_client.create_model_version(
-            name=name,
-            description=description,
-            source="dummy-source",  # Required field, but not used for prompts
-            tags=tags,
-        )
-        return Prompt.from_model_version(mv)
+        # Update the prompt tags
+        if not is_new_prompt:
+            for key, value in tags.items():
+                registry_client.set_registered_model_tag(name, key, value)
+
+        # Version metadata is represented as ModelVersion tags in the registry
+        version_metadata = version_metadata or {}
+        version_metadata.update({IS_PROMPT_TAG_KEY: "true", PROMPT_TEXT_TAG_KEY: template})
+
+        try:
+            mv: ModelVersion = registry_client.create_model_version(
+                name=name,
+                description=commit_message,
+                source="dummy-source",  # Required field, but not used for prompts
+                tags=version_metadata,
+            )
+        except Exception:
+            if is_new_prompt:
+                # When a model version creation fails for the first version of a prompt,
+                # delete the registered model to avoid leaving a prompt with no versions
+                registry_client.delete_registered_model(name)
+            raise
+
+        # Fetch the prompt-level tags from the registered model
+        prompt_tags = registry_client.get_registered_model(name)._tags
+
+        return Prompt.from_model_version(mv, prompt_tags=prompt_tags)
 
     @experimental
     @require_prompt_registry
+    @translate_prompt_exception
     def load_prompt(self, name_or_uri: str, version: Optional[int] = None) -> Prompt:
         """
         Load a :py:class:`Prompt <mlflow.entities.Prompt>` from the MLflow Prompt Registry.
@@ -538,19 +583,29 @@ class MlflowClient:
             version: The version of the prompt. If not specified, the latest version will be loaded.
         """
         if name_or_uri.startswith("prompts:/"):
-            name, version = parse_prompt_uri(name_or_uri)
+            if version is not None:
+                raise MlflowException(
+                    "The `version` argument should not be specified when loading a prompt by URI.",
+                    INVALID_PARAMETER_VALUE,
+                )
+            name, version = self.parse_prompt_uri(name_or_uri)
         else:
             name = name_or_uri
 
         registry_client = self._get_registry_client()
         if version is None:
-            version = registry_client.get_latest_versions(name, stages=ALL_STAGES)[0].version
+            mv = registry_client.get_latest_versions(name, stages=ALL_STAGES)[0]
+        else:
+            mv = registry_client.get_model_version(name, version)
 
-        mv = registry_client.get_model_version(name, version)
-        return Prompt.from_model_version(mv)
+        # Fetch the prompt-level tags from the registered model
+        prompt_tags = registry_client.get_registered_model(name)._tags
+
+        return Prompt.from_model_version(mv, prompt_tags=prompt_tags)
 
     @experimental
     @require_prompt_registry
+    @translate_prompt_exception
     def delete_prompt(self, name: str, version: int):
         """
         Delete a :py:class:`Prompt <mlflow.entities.Prompt>` from the MLflow Prompt Registry.
@@ -561,13 +616,7 @@ class MlflowClient:
         """
         registry_client = self._get_registry_client()
 
-        mv = registry_client.get_model_version(name, version)
-        if IS_PROMPT_TAG_KEY not in mv.tags:
-            raise MlflowException(
-                f"Model '{name}' with version {version} is not a prompt.",
-                INVALID_PARAMETER_VALUE,
-            )
-
+        self._validate_prompt(name, version)
         registry_client.delete_model_version(name, version)
 
         # If no more versions are left, delete the registered model
@@ -577,29 +626,46 @@ class MlflowClient:
     # TODO: Use model_id in MLflow 3.0
     @experimental
     @require_prompt_registry
-    def log_prompt(self, run_id: str, prompt_uri: str) -> None:
+    @translate_prompt_exception
+    def log_prompt(self, run_id: str, prompt: Union[str, Prompt]) -> None:
         """
         Associate a prompt registered within the MLflow Prompt Registry with an MLflow Run.
 
+        .. warning::
+
+            This API is not thread-safe. If you are logging prompts from multiple threads,
+            consider using a lock to ensure that only one thread logs a prompt to a run at a time.
+
         Args:
             run_id: The ID of the run to log the prompt to.
-            prompt_uri: The prompt URI in the format "prompts:/name/version".
+            prompt: A Prompt object or the prompt URI in the format "prompts:/name/version".
         """
-        prompt = self.load_prompt(prompt_uri)
+        if isinstance(prompt, str):
+            prompt = self.load_prompt(prompt)
+        elif isinstance(prompt, Prompt):
+            # NB: We need to load the prompt once from the registry because the tags in
+            # local prompt object may not be in sync with the registry.
+            prompt = self.load_prompt(prompt.uri)
+        elif not isinstance(prompt, Prompt):
+            raise MlflowException.invalid_parameter_value(
+                "The `prompt` argument must be a Prompt object or a prompt URI.",
+            )
+
         if run_id_tags := prompt._tags.get(PROMPT_ASSOCIATED_RUN_IDS_TAG_KEY):
             run_ids = run_id_tags.split(",")
-            run_ids.append(run_id)
+            if run_id not in run_ids:
+                run_ids.append(run_id)
         else:
             run_ids = [run_id]
 
-        name, version = parse_prompt_uri(prompt_uri)
-        self.set_model_version_tag(
-            name, version, PROMPT_ASSOCIATED_RUN_IDS_TAG_KEY, ",".join(run_ids)
+        self._get_registry_client().set_model_version_tag(
+            prompt.name, prompt.version, PROMPT_ASSOCIATED_RUN_IDS_TAG_KEY, ",".join(run_ids)
         )
 
     # TODO: Use model_id in MLflow 3.0
     @experimental
     @require_prompt_registry
+    @translate_prompt_exception
     def detach_prompt_from_run(self, run_id: str, prompt_uri: str) -> None:
         """
         Detach a prompt registered within the MLflow Prompt Registry from an MLflow Run.
@@ -620,17 +686,20 @@ class MlflowClient:
 
         run_ids.remove(run_id)
 
-        name, version = parse_prompt_uri(prompt_uri)
+        name, version = self.parse_prompt_uri(prompt_uri)
         if run_ids:
-            self.set_model_version_tag(
+            self._get_registry_client().set_model_version_tag(
                 name, version, PROMPT_ASSOCIATED_RUN_IDS_TAG_KEY, ",".join(run_ids)
             )
         else:
-            self.delete_model_version_tag(name, version, PROMPT_ASSOCIATED_RUN_IDS_TAG_KEY)
+            self._get_registry_client().delete_model_version_tag(
+                name, version, PROMPT_ASSOCIATED_RUN_IDS_TAG_KEY
+            )
 
     # TODO: Use model_id in MLflow 3.0
     @experimental
     @require_prompt_registry
+    @translate_prompt_exception
     def list_logged_prompts(self, run_id: str) -> list[Prompt]:
         """
         List all prompts associated with an MLflow Run.
@@ -650,6 +719,61 @@ class MlflowClient:
         # NB: We don't support pagination here because the number of prompts associated
         # with a Run is expected to be small.
         return [Prompt.from_model_version(mv) for mv in mvs]
+
+    @experimental
+    @require_prompt_registry
+    @translate_prompt_exception
+    def set_prompt_alias(self, name: str, alias: str, version: int) -> None:
+        """
+        Set an alias for a :py:class:`Prompt <mlflow.entities.Prompt>`.
+
+        Args:
+            name: The name of the prompt.
+            alias: The alias to set for the prompt.
+            version: The version of the prompt.
+        """
+        self._validate_prompt(name, version)
+        self._get_registry_client().set_registered_model_alias(name, alias, version)
+
+    @experimental
+    @require_prompt_registry
+    @translate_prompt_exception
+    def delete_prompt_alias(self, name: str, alias: str) -> None:
+        """
+        Delete an alias for a :py:class:`Prompt <mlflow.entities.Prompt>`.
+
+        Args:
+            name: The name of the prompt.
+            alias: The alias to delete for the prompt.
+        """
+        self._get_registry_client().delete_registered_model_alias(name, alias)
+
+    def _validate_prompt(self, name: str, version: int):
+        registry_client = self._get_registry_client()
+        mv = registry_client.get_model_version(name, version)
+
+        if IS_PROMPT_TAG_KEY not in mv.tags:
+            raise MlflowException(f"Prompt '{name}' does not exist.", RESOURCE_DOES_NOT_EXIST)
+
+    def parse_prompt_uri(self, uri: str) -> tuple[str, str]:
+        """
+        Parse prompt URI into prompt name and prompt version.
+        - 'prompt:/<name>/<version>' -> ('<name>', '<version>')
+        - 'prompt:/<name>' -> ('<name>', '<latest version>')
+        - 'prompt:/<name>@<alias>' -> ('<name>', '<version>')
+        """
+        parsed = urllib.parse.urlparse(uri)
+
+        if parsed.scheme != "prompts":
+            raise MlflowException.invalid_parameter_value(
+                f"Invalid prompt URI: {uri}. Expected schema 'prompts:/<name>/<version>'"
+            )
+
+        # Replace schema to 'models:/' to reuse the model URI parsing logic
+        try:
+            return get_model_name_and_version(self, f"models:{parsed.path}")
+        except MlflowException:
+            raise MlflowException(f"Prompt '{uri}' does not exist.", RESOURCE_DOES_NOT_EXIST)
 
     ##### Tracing #####
 
@@ -1194,7 +1318,6 @@ class MlflowClient:
                 f"Span with ID {span_id} is not found or already finished.",
                 error_code=RESOURCE_DOES_NOT_EXIST,
             )
-
         span.set_attributes(attributes or {})
         if outputs is not None:
             span.set_outputs(outputs)
@@ -3490,6 +3613,7 @@ class MlflowClient:
             tags: {'nlp.framework': 'Spark NLP'}
             description: This sentiment analysis model classifies the tone-happy, sad, angry.
         """
+        self._raise_if_prompt(name)
         self._get_registry_client().rename_registered_model(name, new_name)
 
     def update_registered_model(
@@ -3544,6 +3668,7 @@ class MlflowClient:
         if description is None:
             raise MlflowException("Attempting to update registered model with no new field values.")
 
+        self._raise_if_prompt(name)
         return self._get_registry_client().update_registered_model(
             name=name, description=description
         )
@@ -3603,6 +3728,7 @@ class MlflowClient:
             tags: {'t2': 't2'}
             description: description2
         """
+        self._raise_if_prompt(name)
         self._get_registry_client().delete_registered_model(name)
 
     def search_registered_models(
@@ -3741,7 +3867,13 @@ class MlflowClient:
             tags: {'nlp.framework': 'Spark NLP'}
             description: This sentiment analysis model classifies the tone-happy, sad, angry.
         """
-        return self._get_registry_client().get_registered_model(name)
+        rm = self._get_registry_client().get_registered_model(name)
+
+        # Prompt should not be returned as a registered model
+        if has_prompt_tag(rm._tags):
+            raise _model_not_found(name)
+
+        return rm
 
     @deprecated(since="2.9.0", impact=_STAGES_DEPRECATION_WARNING)
     def get_latest_versions(
@@ -3816,6 +3948,7 @@ class MlflowClient:
             run_id: 31165664be034dc698c52a4bdeb71663
             current_stage: None
         """
+        self._raise_if_prompt(name)
         return self._get_registry_client().get_latest_versions(name, stages)
 
     def set_registered_model_tag(self, name, key, value) -> None:
@@ -3863,6 +3996,7 @@ class MlflowClient:
             name: SocialMediaTextAnalyzer
             tags: {'nlp.framework1': 'Spark NLP', 'nlp.framework2': 'VADER'}
         """
+        self._raise_if_prompt(name)
         self._get_registry_client().set_registered_model_tag(name, key, value)
 
     def delete_registered_model_tag(self, name: str, key: str) -> None:
@@ -3913,6 +4047,7 @@ class MlflowClient:
             name: name2
             tags: {}
         """
+        self._raise_if_prompt(name)
         self._get_registry_client().delete_registered_model_tag(name, key)
 
     # Model Version Methods
@@ -4143,6 +4278,14 @@ class MlflowClient:
                 f"Failed to fetch model version from source model URI: '{src_model_uri}'. "
                 f"Error: {e}"
             ) from e
+
+        if has_prompt_tag(src_mv._tags):
+            # Prompt should not be used as a model version
+            raise MlflowException(
+                f"Model with uri '{src_model_uri}' not found",
+                RESOURCE_DOES_NOT_EXIST,
+            )
+
         return client.copy_model_version(src_mv=src_mv, dst_name=dst_name)
 
     def update_model_version(
@@ -4214,6 +4357,7 @@ class MlflowClient:
         if description is None:
             raise MlflowException("Attempting to update model version with no new field values.")
 
+        self._raise_if_prompt(name)
         return self._get_registry_client().update_model_version(
             name=name, version=version, description=description
         )
@@ -4293,6 +4437,7 @@ class MlflowClient:
             Description: A new version of the model using ensemble trees
             Stage: Staging
         """
+        self._raise_if_prompt(name)
         return self._get_registry_client().transition_model_version_stage(
             name, version, stage, archive_existing_versions
         )
@@ -4382,6 +4527,7 @@ class MlflowClient:
             run_id: 9165d4f8aa0a4d069550824bdc55caaf
             current_stage: None
         """
+        self._raise_if_prompt(name)
         self._get_registry_client().delete_model_version(name, version)
 
     def get_model_version(self, name: str, version: str) -> ModelVersion:
@@ -4448,7 +4594,10 @@ class MlflowClient:
             Version: 2
 
         """
-        return self._get_registry_client().get_model_version(name, version)
+        mv = self._get_registry_client().get_model_version(name, version)
+        if has_prompt_tag(mv._tags):
+            raise _model_not_found(name)
+        return mv
 
     def get_model_version_download_uri(self, name: str, version: str) -> str:
         """
@@ -4495,6 +4644,7 @@ class MlflowClient:
 
             Download URI: runs:/027d7bbe81924c5a82b3e4ce979fcab7/sklearn-model
         """
+        self._raise_if_prompt(name)
         return self._get_registry_client().get_model_version_download_uri(name, version)
 
     def search_model_versions(
@@ -4707,6 +4857,7 @@ class MlflowClient:
             Tags: {'t': '1', 't1': '1'}
         """
         _validate_model_version_or_stage_exists(version, stage)
+        self._raise_if_prompt(name)
         if stage:
             warnings.warn(
                 "The `stage` parameter of the `set_model_version_tag` API is deprecated. "
@@ -4797,6 +4948,7 @@ class MlflowClient:
             Tags: {}
         """
         _validate_model_version_or_stage_exists(version, stage)
+        self._raise_if_prompt(name)
         if stage:
             warnings.warn(
                 "The `stage` parameter of the `delete_model_version_tag` API is deprecated. "
@@ -4896,6 +5048,7 @@ class MlflowClient:
         _validate_model_name(name)
         _validate_model_alias_name(alias)
         _validate_model_version(version)
+        self._raise_if_prompt(name)
         self._get_registry_client().set_registered_model_alias(name, alias, version)
 
     def delete_registered_model_alias(self, name: str, alias: str) -> None:
@@ -4992,6 +5145,7 @@ class MlflowClient:
         """
         _validate_model_name(name)
         _validate_model_alias_name(alias)
+        self._raise_if_prompt(name)
         self._get_registry_client().delete_registered_model_alias(name, alias)
 
     def get_model_version_by_alias(self, name: str, alias: str) -> ModelVersion:
@@ -5079,4 +5233,17 @@ class MlflowClient:
             Aliases: ["test-alias"]
         """
         _validate_model_name(name)
-        return self._get_registry_client().get_model_version_by_alias(name, alias)
+        mv = self._get_registry_client().get_model_version_by_alias(name, alias)
+
+        if has_prompt_tag(mv._tags):
+            raise _model_not_found(name)
+
+        return mv
+
+    def _raise_if_prompt(self, name: str) -> None:
+        """
+        Validate if the given name is registered as a Prompt rather than a Registered Model.
+        """
+        rm = self.get_registered_model(name)
+        if has_prompt_tag(rm._tags):
+            raise _model_not_found(name)

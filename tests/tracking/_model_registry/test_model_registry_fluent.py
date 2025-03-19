@@ -116,20 +116,20 @@ def test_crud_prompts(tmp_path):
     mlflow.register_prompt(
         name="prompt_1",
         template="Hi, {title} {name}! How are you today?",
-        description="A friendly greeting",
+        commit_message="A friendly greeting",
         tags={"model": "my-model"},
     )
 
     prompt = mlflow.load_prompt("prompt_1")
     assert prompt.name == "prompt_1"
     assert prompt.template == "Hi, {title} {name}! How are you today?"
-    assert prompt.description == "A friendly greeting"
+    assert prompt.commit_message == "A friendly greeting"
     assert prompt.tags == {"model": "my-model"}
 
     mlflow.register_prompt(
         name="prompt_1",
         template="Hi, {title} {name}! What's up?",
-        description="New greeting",
+        commit_message="New greeting",
     )
 
     prompt = mlflow.load_prompt("prompt_1")
@@ -147,7 +147,44 @@ def test_crud_prompts(tmp_path):
 
     mlflow.delete_prompt("prompt_1", version=2)
 
-    with pytest.raises(MlflowException, match=r"Model Version (.*) not found"):
+    with pytest.raises(MlflowException, match=r"Prompt \(name=prompt_1, version=2\) not found"):
         mlflow.load_prompt("prompt_1", version=2)
 
     mlflow.delete_prompt("prompt_1", version=1)
+
+
+def test_prompt_alias(tmp_path):
+    registry_uri = "sqlite:///{}".format(tmp_path.joinpath("test.db"))
+    mlflow.set_registry_uri(registry_uri)
+
+    mlflow.register_prompt(name="p1", template="Hi, there!")
+    mlflow.register_prompt(name="p1", template="Hi, {{name}}!")
+
+    mlflow.set_prompt_alias("p1", alias="production", version=1)
+    prompt = mlflow.load_prompt("prompts:/p1@production")
+    assert prompt.template == "Hi, there!"
+    assert prompt.aliases == ["production"]
+
+    # Reassign alias to a different version
+    mlflow.set_prompt_alias("p1", alias="production", version=2)
+    assert mlflow.load_prompt("prompts:/p1@production").template == "Hi, {{name}}!"
+
+    mlflow.delete_prompt_alias("p1", alias="production")
+    with pytest.raises(MlflowException, match=r"Prompt (.*) does not exist."):
+        mlflow.load_prompt("prompts:/p1@production")
+
+
+def test_prompt_associate_with_run(tmp_path):
+    registry_uri = "sqlite:///{}".format(tmp_path.joinpath("test.db"))
+    mlflow.set_registry_uri(registry_uri)
+
+    mlflow.register_prompt(name="prompt_1", template="Hi, {title} {name}! How are you today?")
+
+    # mlflow.load_prompt() call during the run should associate the prompt with the run
+    with mlflow.start_run() as run:
+        mlflow.load_prompt("prompt_1", version=1)
+
+    prompts = MlflowClient().list_logged_prompts(run.info.run_id)
+    assert len(prompts) == 1
+    assert prompts[0].name == "prompt_1"
+    assert prompts[0].version == 1
