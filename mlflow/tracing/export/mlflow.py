@@ -52,12 +52,17 @@ class MlflowSpanExporter(SpanExporter):
             spans: A sequence of OpenTelemetry ReadableSpan objects passed from
                 a span processor. Only root spans for each trace should be exported.
         """
+        print("MLFLOW span expeorter called")
         for span in spans:
+            print('----------------exporttrace---------------')
+            print(span.to_json())
             if span._parent is not None:
                 _logger.debug("Received a non-root span. Skipping export.")
                 continue
 
+            print(self._trace_manager._traces)
             trace = self._trace_manager.pop_trace(span.context.trace_id)
+
             if trace is None:
                 _logger.debug(f"TraceInfo for span {span} not found. Skipping export.")
                 continue
@@ -74,10 +79,16 @@ class MlflowSpanExporter(SpanExporter):
                 # an MLflow model evaluation context
                 self._display_handler.display_traces([trace])
 
+            print("Trace spans being exported:")
+            for s in trace.data.spans:
+                print(f"- {s.name}")
+
             self._log_trace(trace)
 
     def _log_trace(self, trace: Trace):
         """Log the trace to MLflow backend."""
+        print("---------------------SPAN export---------------------")
+        print(trace.info)
         upload_trace_data_task = Task(
             handler=self._client._upload_trace_data,
             args=(trace.info, trace.data),

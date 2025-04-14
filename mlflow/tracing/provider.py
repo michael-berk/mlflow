@@ -87,9 +87,15 @@ def start_detached_span(
         The newly created OpenTelemetry span.
     """
     tracer = _get_tracer(__name__)
+    print("STARTDETACEHEDSPAN!!!!!!!!!!!!")
+    print(dir(tracer) )
+    print(tracer.span_processor.__class__.__name__)
+    print(tracer.span_processor._span_processors)
+    # TODO: this is the key point where the wrapping needs to be applied
+
     context = trace.set_span_in_context(parent) if parent else None
     attributes = {}
-
+    
     # Set start time and experiment to attribute so we can pass it to the span processor
     if start_time_ns:
         attributes[SpanAttributeKey.START_TIME_NS] = json.dumps(start_time_ns)
@@ -191,6 +197,7 @@ def set_destination(destination: TraceDestination):
     _setup_tracer_provider()
 
 
+
 def _get_tracer(module_name: str):
     """
     Get a tracer instance for the given module name.
@@ -223,6 +230,7 @@ def _setup_tracer_provider(disabled=False):
     only once, and update the _MLFLOW_TRACER_PROVIDER_INITIALIZED flag accordingly.
     """
     global _MLFLOW_TRACER_PROVIDER
+    print("THIS WAS CALLED")
 
     if disabled:
         _MLFLOW_TRACER_PROVIDER = trace.NoOpTracerProvider()

@@ -95,12 +95,19 @@ class InMemoryTraceManager:
         Args:
             span: The span to be stored.
         """
+        print("Registeringspan")
         if not isinstance(span, LiveSpan):
+            print("NOT LIVE SPAN")
             _logger.debug(f"Invalid span object {type(span)} is passed. Skipping.")
             return
 
         with self._lock:
+            print("attemting register")
+            print(span.request_id)
+            print(self._traces.keys())
             trace_data_dict = self._traces[span.request_id].span_dict
+            print(span.span_id)
+            print(trace_data_dict.keys())
             trace_data_dict[span.span_id] = span
 
     @contextlib.contextmanager
@@ -154,6 +161,7 @@ class InMemoryTraceManager:
         """
         Pop the trace data for the given id and return it as a ready-to-publish Trace object.
         """
+        print("pop trace called")
         with self._lock:
             request_id = self._trace_id_to_request_id.pop(trace_id, None)
             trace = self._traces.pop(request_id, None)
