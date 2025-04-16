@@ -5,6 +5,7 @@ import openai
 import pytest
 
 from semantic_kernel import Kernel
+from semantic_kernel.agents import ChatCompletionAgent
 from semantic_kernel.connectors.ai.open_ai import OpenAIChatCompletion
 from semantic_kernel.contents import ChatHistory
 from semantic_kernel.exceptions.function_exceptions import FunctionExecutionException
@@ -43,7 +44,7 @@ async def _create_and_invoke_kernel_complex(mock_openai):
     kernel.add_service(
         OpenAIChatCompletion(
             service_id="chat-gpt",
-            ai_model_id="gpt-3.5-turbo",
+            ai_model_id="gpt-4o-mini",
             async_client=openai_client,
         )
     )
@@ -80,6 +81,21 @@ async def _create_and_invoke_kernel_complex(mock_openai):
     )
 
 
+async def _create_and_invoke_chat_agent(mock_openai):
+    openai_client = openai.AsyncOpenAI(api_key="test", base_url=mock_openai)
+    service = OpenAIChatCompletion(
+        service_id="chat-gpt",
+        ai_model_id="gpt-4o-mini",
+        async_client=openai_client,
+    )
+    agent = ChatCompletionAgent(
+        service=service,
+        name="sushi_agent",
+        instructions="You are a master at all things sushi. But, you are not very smart.",
+    )
+    return await agent.get_response(messages="How do I make sushi?")
+
+
 def test_override_of_span_processor():
     mlflow.semantic_kernel.autolog()
 
@@ -96,49 +112,6 @@ def test_override_of_span_processor():
     # Assert genai attributes will be logged
     assert are_sensitive_events_enabled()
 
-
-@pytest.mark.asyncio
-async def test_sk_invoke_complex(mock_openai):
-    mlflow.semantic_kernel.autolog()
-    _ = await _create_and_invoke_kernel_complex(mock_openai)
-
-    traces = get_traces()
-    assert len(traces) == 1
-    trace = traces[0]
-    spans = trace.data.spans
-    assert len(spans) == 2
-
-    root_span = next(s for s in spans if s.parent_id is None)
-    child_span = next(s for s in spans if s.parent_id == root_span.span_id)
-
-    root_dict = root_span.to_dict()
-    child_dict = child_span.to_dict()
-
-    # Validate root span
-    assert root_dict["name"] == "ChatBot-Chat"
-    assert root_dict["attributes"]["mlflow.traceRequestId"].replace('"', '') == trace.info.request_id
-    assert root_dict["attributes"]["mlflow.spanType"] == '"UNKNOWN"'
-
-    # Validate child span
-    assert child_dict["name"] == "chat.completions gpt-3.5-turbo"
-    assert child_dict["parent_id"] == root_span.span_id
-    attributes = child_dict["attributes"]
-
-    assert attributes["mlflow.spanType"] == "CHAT_MODEL"
-    assert attributes["gen_ai.operation.name"] == "chat.completions"
-    assert attributes["gen_ai.system"] == "openai"
-    assert attributes["gen_ai.request.model"] == "gpt-3.5-turbo"
-    assert attributes["gen_ai.response.id"] == "chatcmpl-123"
-    assert attributes["gen_ai.response.finish_reason"] == "FinishReason.STOP"
-    assert attributes["gen_ai.usage.input_tokens"] == 9
-    assert attributes["gen_ai.usage.output_tokens"] == 12
-
-    # Validate the input prompt was captured
-    span_inputs = json.loads(attributes["mlflow.spanInputs"])
-    assert isinstance(span_inputs, dict)
-    assert "messages" in span_inputs
-    assert any("I want to find a hotel in Seattle with free wifi and a pool." in m["content"]
-            for m in span_inputs["messages"])
 
 @pytest.mark.asyncio
 async def test_sk_invoke_simple(mock_openai):
@@ -168,6 +141,84 @@ async def test_sk_invoke_simple(mock_openai):
     if isinstance(outputs, str):
         outputs = json.loads(outputs)
     assert isinstance(outputs, list)
+
+
+@pytest.mark.asyncio
+async def test_sk_invoke_complex(mock_openai):
+    mlflow.semantic_kernel.autolog()
+    _ = await _create_and_invoke_kernel_complex(mock_openai)
+
+    traces = get_traces()
+    assert len(traces) == 1
+    trace = traces[0]
+    spans = trace.data.spans
+    assert len(spans) == 2
+
+    root_span = next(s for s in spans if s.parent_id is None)
+    child_span = next(s for s in spans if s.parent_id == root_span.span_id)
+
+    root_dict = root_span.to_dict()
+    child_dict = child_span.to_dict()
+
+    # Validate root span
+    assert root_dict["name"] == "ChatBot-Chat"
+    assert root_dict["attributes"]["mlflow.traceRequestId"].replace('"', '') == trace.info.request_id
+    assert root_dict["attributes"]["mlflow.spanType"] == '"UNKNOWN"'
+
+    # Validate child span
+    assert child_dict["name"] == "chat.completions gpt-4o-mini"
+    assert child_dict["parent_id"] == root_span.span_id
+    attributes = child_dict["attributes"]
+
+    assert attributes["mlflow.spanType"] == "CHAT_MODEL"
+    assert attributes["gen_ai.operation.name"] == "chat.completions"
+    assert attributes["gen_ai.system"] == "openai"
+    assert attributes["gen_ai.request.model"] == "gpt-4o-mini"
+    assert attributes["gen_ai.response.id"] == "chatcmpl-123"
+    assert attributes["gen_ai.response.finish_reason"] == "FinishReason.STOP"
+    assert attributes["gen_ai.usage.input_tokens"] == 9
+    assert attributes["gen_ai.usage.output_tokens"] == 12
+
+    # Validate the input prompt was captured
+    span_inputs = json.loads(attributes["mlflow.spanInputs"])
+    assert isinstance(span_inputs, dict)
+    assert "messages" in span_inputs
+    assert any("I want to find a hotel in Seattle with free wifi and a pool." in m["content"]
+            for m in span_inputs["messages"])
+
+@pytest.mark.asyncio
+async def test_sk_invoke_agent(mock_openai):
+    mlflow.semantic_kernel.autolog()
+    _ = await _create_and_invoke_chat_agent(mock_openai)
+
+    traces = get_traces()
+    assert len(traces) == 1
+    trace = traces[0]
+    spans = trace.data.spans
+    assert len(spans) == 3
+
+    root_span = next(s for s in spans if s.parent_id is None)
+    child_span = next(s for s in spans if s.parent_id == root_span.span_id)
+    grandchild_span = next(s for s in spans if s.parent_id == child_span.span_id)
+
+    root = root_span.to_dict()
+    assert root["name"] == "invoke_agent sushi_agent"
+    assert root["attributes"]["mlflow.spanType"] == '"UNKNOWN"'
+    assert root["attributes"]["gen_ai.operation.name"] == "invoke_agent"
+    assert root["attributes"]["gen_ai.agent.name"] == "sushi_agent"
+
+    child = child_span.to_dict()
+    assert child["name"] == "AutoFunctionInvocationLoop"
+    assert child["attributes"]["mlflow.spanType"] == '"UNKNOWN"'
+    assert "sk.available_functions" in child["attributes"]
+
+    grandchild = grandchild_span.to_dict()
+    assert grandchild["name"].startswith("chat.completions")
+    assert grandchild["attributes"]["mlflow.spanType"] == "CHAT_MODEL"
+    assert grandchild["attributes"]["gen_ai.request.model"] == "gpt-4o-mini"
+    assert "How do I make sushi?" in grandchild["attributes"]["mlflow.spanInputs"]
+    assert grandchild["attributes"]["gen_ai.response.finish_reason"] == "FinishReason.STOP"
+
 
 
 @pytest.mark.asyncio

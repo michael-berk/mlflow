@@ -128,7 +128,7 @@ def _semantic_kernel_chat_completion_input_wrapper(original, *args, **kwargs) ->
         if isinstance(prompt, ChatHistory):
             prompt_value = [msg.to_dict() for msg in prompt.messages]
         elif not isinstance(prompt, list):
-            prompt_value = [value]
+            prompt_value = [prompt]
         else:
             prompt_value = prompt
 
