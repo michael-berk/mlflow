@@ -1002,6 +1002,9 @@ class MlflowClient:
             mlflow_span.set_attributes(attributes or {})
 
             trace_manager = InMemoryTraceManager.get_instance()
+            print("alskdf")
+            print(request_id)
+            print(trace_manager._traces)
             tags = exclude_immutable_tags(tags or {})
             # Update trace tags for trace in in-memory trace manager
             with trace_manager.get_trace(request_id) as trace:
@@ -1014,7 +1017,8 @@ class MlflowClient:
             _logger.warning(
                 f"Failed to start trace {name}: {e}. "
                 "For full traceback, set logging level to debug.",
-                exc_info=_logger.isEnabledFor(logging.DEBUG),
+                # exc_info=_logger.isEnabledFor(logging.DEBUG),
+                exc_info=True,
             )
             return NoOpSpan()
 

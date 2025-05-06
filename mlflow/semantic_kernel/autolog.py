@@ -27,6 +27,9 @@ import mlflow
 import mlflow.tracing.provider
 from mlflow.entities import SpanType
 from mlflow.entities.span import LiveSpan
+from mlflow.entities.trace_info import TraceInfo
+from mlflow.tracing.constant import TRACE_SCHEMA_VERSION, TRACE_SCHEMA_VERSION_KEY, SpanAttributeKey
+from mlflow.entities.trace_status import TraceStatus
 from mlflow.entities.span_event import SpanEvent
 from mlflow.entities.span_status import SpanStatusCode
 from mlflow.tracing.assessment import MlflowClient
@@ -69,14 +72,29 @@ class SemanticKernelSpanProcessor(SimpleSpanProcessor):
     def on_start(self, span: OTelSpan, parent_context: Optional[Context] = None):
         print("Wrapper on start!!!!!!!!")
         print("0-934" * 20)
-        # print(span.to_json())
+        print(span.to_json())
         print("0-934" * 20)
+
         self._base_span_processor.on_start(span, parent_context)
 
+        trace_id = span.context.trace_id
         tm = InMemoryTraceManager.get_instance()
-        request_id = tm.get_request_id_from_trace_id(span.context.trace_id)
-        span_type = _get_span_type(span)
+        request_id = tm.get_request_id_from_trace_id(trace_id)
 
+        # # Register trace if trace_id is new and span has request_id attribute
+        # if request_id is None and span._parent is not None:
+        #     print('linkingnewrequestid')
+        #     request_id_attr = span.attributes.get(SpanAttributeKey.REQUEST_ID)
+        #     if request_id_attr:
+        #         request_id = json.loads(request_id_attr)
+        #         trace_info = TraceInfo(
+        #             request_id=request_id,
+        #             experiment_id=None,
+        #             timestamp_ms=span.start_time // 1_000_000,
+        #             execution_time_ms=None,
+        #             status=TraceStatus.IN_PROGRESS,
+        #         )
+        #         tm.register_trace(trace_id, trace_info)
         if span.parent and not request_id:
             _logger.debug(
                 "Received a non-root span but the request ID is not found. "
@@ -89,8 +107,26 @@ class SemanticKernelSpanProcessor(SimpleSpanProcessor):
                 span.request_id, TraceMetadataKey.SOURCE_RUN, active_run.info.run_id
             )
 
+        # print("REGISTERINGSPANHERE")
+        # print(request_id)
+        # print(span.to_json())
+        # request_id = span.attributes.get("mlflow.traceRequestId")
+        # if request_id:
+        #     request_id = json.loads(request_id) if isinstance(request_id, str) else request_id
+        # assert request_id , "request_idisnone"
+        # print("ttltraces")
+        # print(tm._traces)
+        # print(tm._trace_id_to_request_id)
+
+        
+        span_type =  _get_span_type(span)
         live_span = LiveSpan(span, request_id, span_type)
         tm.register_span(live_span)
+        print(f"[register_trace] keys={list(tm._traces)}")
+
+        #TODO: add this to all the span processors not self._trace_manager.get_trace(span.context.trace_id)
+        # AND register the trace in the trace manager here if trace id not in there
+
 
     def on_end(self, span: OTelReadableSpan) -> None:
         print("Wrapper on end!!!!!!!!")
@@ -230,26 +266,78 @@ def _set_logging_env_variables():
 
 def _wrap_mlflow_processor_with_semantic_kernel_processor():
     print("wrap_mlflow_processor_with_semantic_kernel_processor CALLED!!!!")
+    from opentelemetry.trace import _TRACER_PROVIDER_SET_ONCE
+    _TRACER_PROVIDER_SET_ONCE._done = False
+    
     from mlflow.tracing.provider import _MLFLOW_TRACER_PROVIDER
 
     if not _MLFLOW_TRACER_PROVIDER or not hasattr(
         _MLFLOW_TRACER_PROVIDER, "_active_span_processor"
-    ):
+    ) or not _MLFLOW_TRACER_PROVIDER._active_span_processor._span_processors:
         mlflow.tracing.provider._setup_tracer_provider()
 
     from mlflow.tracing.provider import _MLFLOW_TRACER_PROVIDER, _MLFLOW_TRACER_PROVIDER_INITIALIZED
 
     multi_processor = _MLFLOW_TRACER_PROVIDER._active_span_processor
     current_span_processor = multi_processor._span_processors[0]
-    wrapped = SemanticKernelSpanProcessor(current_span_processor)
-    multi_processor._span_processors = (wrapped,)
+    print("wrappingit")
+    print(current_span_processor)
+    print(id(current_span_processor._trace_manager))
+    if not isinstance(current_span_processor, SemanticKernelSpanProcessor):
+        wrapped = SemanticKernelSpanProcessor(current_span_processor)
+        multi_processor._span_processors = (wrapped,)
+    print(current_span_processor)
+    print(multi_processor._span_processors)
+
+    print('---------------')
+    print('asdlkfjads')
+    from opentelemetry.trace import get_tracer_provider
+    from opentelemetry.sdk.trace import TracerProvider
+
+    provider = get_tracer_provider()
+    real_provider = getattr(provider, "_delegate", provider)
+
+    if isinstance(real_provider, TracerProvider):
+        span_processors = real_provider._active_span_processor._span_processors
+        for span_processor in span_processors:
+            if hasattr(span_processor, "_base_span_processor"):
+                span_processor._base_span_processor._trace_manager = current_span_processor._trace_manager
+                span_processor._base_span_processor._client = current_span_processor._client
+                span_processor._base_span_processor.span_exporter._trace_manager = current_span_processor._trace_manager
+                span_processor._base_span_processor.span_exporter._client = current_span_processor._client
+            else:
+                span_processor._trace_manager = current_span_processor._trace_manager
+                span_processor._client = current_span_processor._client
+                span_processor.span_exporter._trace_manager = current_span_processor._trace_manager
+                span_processor.span_exporter._client = current_span_processor._client
+        # print("processorID!!!!!!!")
+        # print(id(span_processors[0]._base_span_processor._trace_manager))
+        # span_processors[0]._base_span_processor._trace_manager = current_span_processor._trace_manager
+        # print(id(span_processors[0]._base_span_processor._trace_manager))
+        # print("tracerID!!!!!!!")
+        # print(id(span_processors[0]._base_span_processor.span_exporter._trace_manager))
+        # span_processors[0]._base_span_processor.span_exporter._trace_manager = current_span_processor._trace_manager
+        # print(id(span_processors[0]._base_span_processor.span_exporter._trace_manager))
+        # print(span_processors)
+
+    provider = get_tracer_provider().get_tracer(__name__)
+    print(provider)
+
+    if isinstance(provider, TracerProvider):
+        span_processors = provider._active_span_processor._span_processors
+
+        for span_processor in span_processors:
+            print(span_processor)
+            print(span_processor._trace_manager)
+
+    print('---------------')
 
     # NB: we must set this value to True to avoid re-initializing the provider
     # in the _get_tracer method, which is called when starting a detached span.
     _MLFLOW_TRACER_PROVIDER_INITIALIZED.done = True
 
 
-def _set_tracer_provider_with_mlflow_tracer_provider():
+def _set_otel_tracer_provider_with_mlflow_tracer_provider():
     from mlflow.tracing.provider import _MLFLOW_TRACER_PROVIDER
 
     if _MLFLOW_TRACER_PROVIDER:
@@ -261,7 +349,12 @@ def _set_tracer_provider_with_mlflow_tracer_provider():
 def setup_semantic_kernel_tracing():
     _set_logging_env_variables()
     _wrap_mlflow_processor_with_semantic_kernel_processor()
-    _set_tracer_provider_with_mlflow_tracer_provider()
+    _set_otel_tracer_provider_with_mlflow_tracer_provider()
+    
+    from opentelemetry import trace
+    print("SK tracer ID:", id(trace.get_tracer_provider()))
+    from mlflow.tracing.provider import _MLFLOW_TRACER_PROVIDER
+    print("MLflow tracer ID:", id(_MLFLOW_TRACER_PROVIDER))
 
 
 # TODO: remove this util

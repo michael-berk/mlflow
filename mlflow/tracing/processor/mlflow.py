@@ -91,6 +91,7 @@ class MlflowSpanProcessor(SimpleSpanProcessor):
             print(span.context.trace_id)
             self._trace_manager.register_trace(span.context.trace_id, trace_info)
             request_id = trace_info.request_id
+            print(request_id)
 
             # NB: This is a workaround to exclude the latency of backend StartTrace API call (within
             #   _create_trace_info()) from the execution time of the span. The API call takes ~1 sec
@@ -99,6 +100,11 @@ class MlflowSpanProcessor(SimpleSpanProcessor):
                 span._start_time = time.time_ns()
 
         span.set_attribute(SpanAttributeKey.REQUEST_ID, json.dumps(request_id))
+        print(span.attributes.get(SpanAttributeKey.REQUEST_ID))
+        print("MLflowSpanProcessor on_start trace_manager--------------------")
+        print(f"[TraceManager] get_instance called: id={id(self._trace_manager)}")
+        print(self._trace_manager._traces)
+        print(self._trace_manager._trace_id_to_request_id)
 
     def _start_trace(self, span: OTelSpan, start_time_ns: Optional[int]) -> TraceInfo:
         from mlflow.tracking.fluent import _get_latest_active_run

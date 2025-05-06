@@ -304,13 +304,21 @@ class TrackingServiceClient:
         order_by: Optional[list[str]] = None,
         page_token: Optional[str] = None,
     ):
-        return self.store.search_traces(
+        out = self.store.search_traces(
             experiment_ids=experiment_ids,
             filter_string=filter_string,
             max_results=max_results,
             order_by=order_by,
             page_token=page_token,
         )
+        print("tracesraw")
+        print(experiment_ids)
+        print(filter_string)
+        print(max_results)
+        print(order_by)
+        print(page_token)
+        print(out)
+        return out
 
     def search_traces(
         self,
@@ -321,6 +329,7 @@ class TrackingServiceClient:
         page_token: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> PagedList[Trace]:
+        print("download_trafce_data")
         def download_trace_extra_fields(trace_info: TraceInfo) -> Optional[Trace]:
             """
             Download trace data and assessments for the given trace_info and returns a Trace object.
@@ -361,6 +370,8 @@ class TrackingServiceClient:
                 filter_string += f" AND {additional_filter}"
             else:
                 filter_string = additional_filter
+        print('filterstring')
+        print(filter_string)
 
         traces = []
         next_max_results = max_results
@@ -931,6 +942,8 @@ class TrackingServiceClient:
 
     def _upload_trace_data(self, trace_info: TraceInfo, trace_data: TraceData) -> None:
         artifact_repo = self._get_artifact_repo_for_trace(trace_info)
+        print("_upload_trace_datahere")
+        print(artifact_repo)
         trace_data_json = json.dumps(trace_data.to_dict(), cls=TraceJSONEncoder, ensure_ascii=False)
         return artifact_repo.upload_trace_data(trace_data_json)
 

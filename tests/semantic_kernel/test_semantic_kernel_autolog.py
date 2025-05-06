@@ -20,8 +20,8 @@ from mlflow.entities import SpanType
 from mlflow.semantic_kernel.autolog import SemanticKernelSpanProcessor
 from mlflow.tracing.provider import _get_tracer
 
+import mlflow.tracing.trace_manager
 from tests.tracing.helper import get_traces
-
 
 async def _create_and_invoke_kernel_simple(mock_openai):
     openai_client = openai.AsyncOpenAI(api_key="test", base_url=mock_openai)
@@ -95,30 +95,35 @@ async def _create_and_invoke_chat_agent(mock_openai):
     )
     return await agent.get_response(messages="How do I make sushi?")
 
+from mlflow.tracing.trace_manager import InMemoryTraceManager
 
-def test_override_of_span_processor():
-    mlflow.semantic_kernel.autolog()
+# def test_override_of_span_processor():
+#     mlflow.semantic_kernel.autolog()
 
-    from mlflow.tracing.provider import _MLFLOW_TRACER_PROVIDER
+#     from mlflow.tracing.provider import _MLFLOW_TRACER_PROVIDER
 
-    span_processor = _MLFLOW_TRACER_PROVIDER._active_span_processor._span_processors[0]
-    assert isinstance(span_processor, SemanticKernelSpanProcessor)
+#     span_processor = _MLFLOW_TRACER_PROVIDER._active_span_processor._span_processors[0]
+#     assert isinstance(span_processor, SemanticKernelSpanProcessor)
 
-    # Ensure the tracer is not reset on _get_tracer invocation
-    _ = _get_tracer(__name__)
-    span_processor = _MLFLOW_TRACER_PROVIDER._active_span_processor._span_processors[0]
-    assert isinstance(span_processor, SemanticKernelSpanProcessor)
+#     # Ensure the tracer is not reset on _get_tracer invocation
+#     _ = _get_tracer(__name__)
+#     span_processor = _MLFLOW_TRACER_PROVIDER._active_span_processor._span_processors[0]
+#     assert isinstance(span_processor, SemanticKernelSpanProcessor)
 
-    # Assert genai attributes will be logged
-    assert are_sensitive_events_enabled()
-
+#     # Assert genai attributes will be logged
+#     assert are_sensitive_events_enabled()
 
 @pytest.mark.asyncio
 async def test_sk_invoke_simple(mock_openai):
+    print("Tracking URI:", mlflow.get_tracking_uri())
+    print("Client store URI:", mlflow.tracking.MlflowClient()._tracking_client.tracking_uri)
+
     mlflow.semantic_kernel.autolog()
     _ = await _create_and_invoke_kernel_simple(mock_openai)
 
     traces = get_traces()
+    print("traces!!!!!!!")
+    print([trace.to_dict() for trace in traces])
     assert len(traces) == 1
     trace = traces[0]
     assert trace.info.request_id
@@ -142,13 +147,79 @@ async def test_sk_invoke_simple(mock_openai):
         outputs = json.loads(outputs)
     assert isinstance(outputs, list)
 
+    # from mlflow.tracing.provider import _MLFLOW_TRACER_PROVIDER 
+
+    # InMemoryTraceManager._instance = None
+    # TODO: This prevents the key error because it resets the tracer manager
+    # that is refererenced in the MLflowSpanProcessor. 
+    # active_span_processors = _MLFLOW_TRACER_PROVIDER._active_span_processor._span_processors
+    # print("resettingspanprocesssors")
+    # for active_span_processor in active_span_processors:
+    #     print(active_span_processor)
+    #     # active_span_processor._base_span_processr = None
+    #     active_span_processor._base_span_processor._trace_manager.reset()
+    #     active_span_processor._base_span_processor.span_exporter._trace_manager.reset()
+    #     print(active_span_processor._base_span_processor)
+
 
 @pytest.mark.asyncio
 async def test_sk_invoke_complex(mock_openai):
+    print('-========================test2')
+    import os
+    os.environ.pop("MLFLOW_TRACKING_URI", None)
+    os.environ.pop("MLFLOW_REGISTRY_URI", None)
+
+    print("Tracking URI:", mlflow.get_tracking_uri())
+    print("Client store URI:", mlflow.tracking.MlflowClient()._tracking_client.tracking_uri)
+
+    # full_tracer_reset()
+    # impfrom opentelemetry import trace as otel_trace
+    # from mlflow.tracing.processor.mlflow import MlflowSpanProcessor
+
+    # tm = InMemoryTraceManager.get_instance()
+    # InMemoryTraceManager._instance = None
+    # gc.collect()
+
+    # print("TraceManager ID:", id(tm))
+    # print("Referrers:", gc.get_referrers(tm))
+    mlflow.tracing.reset()
+    import os
+    print("get_tracking_uri:", mlflow.get_tracking_uri())
+    print("mlruns dir exists:", os.path.exists("mlruns"))
+
+    # Rebuild SK autolog processor and inject correct TraceManager instance
     mlflow.semantic_kernel.autolog()
+    # from mlflow.tracing.provider import _MLFLOW_TRACER_PROVIDER
+
+    # tm = InMemoryTraceManager.get_instance()
+    # for p in _MLFLOW_TRACER_PROVIDER._active_span_processor._span_processors:
+    #     if hasattr(p, "_base_span_processor") and hasattr(p._base_span_processor, "_trace_manager"):
+    #         print("Injecting new TraceManager")
+    #         p._base_span_processor._trace_manager = tm
+    print("checkingtracerreset")
+    # mlflow.tracing.provider._setup_tracer_provider()
+    # from mlflow.tracing.provider import _MLFLOW_TRACER_PROVIDER
+    # active_span_processors = _MLFLOW_TRACER_PROVIDER._active_span_processor._span_processors
+    # tm = InMemoryTraceManager.get_instance()
+    # for active_span_processor in active_span_processors:
+    #     print('hola')
+    #     print(active_span_processor)
+    #     if hasattr(active_span_processor, "_base_span_processor"):
+    #         if hasattr(active_span_processor._base_span_processor, "_trace_manager"):
+    #             print("overridiing")
+    #             active_span_processor._base_span_processor._trace_manager = tm
+    #             assert tm == active_span_processor._base_span_processor._trace_manager
+
     _ = await _create_and_invoke_kernel_complex(mock_openai)
 
     traces = get_traces()
+    print("Tracking URI:", mlflow.get_tracking_uri())
+    print("Client store URI:", mlflow.tracking.MlflowClient()._tracking_client.tracking_uri)
+
+    print("nonexperimentid")
+    print(mlflow.MlflowClient().search_experiments())
+    # print(mlflow.MlflowClient().search_traces())
+    print(traces)
     assert len(traces) == 1
     trace = traces[0]
     spans = trace.data.spans

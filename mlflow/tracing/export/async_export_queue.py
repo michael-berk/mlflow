@@ -27,6 +27,8 @@ class Task:
 
     def handle(self) -> None:
         """Handle the task execution. This method must not raise any exception."""
+        print('handlecalled')
+        print(self.args)
         try:
             self.handler(*self.args)
         except Exception as e:

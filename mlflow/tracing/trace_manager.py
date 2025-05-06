@@ -51,6 +51,8 @@ class InMemoryTraceManager:
             with cls._instance_lock:
                 if cls._instance is None:
                     cls._instance = InMemoryTraceManager()
+        print(f"[TraceManager] get_instance called: id={id(cls._instance)}")
+
         return cls._instance
 
     def __init__(self):
@@ -69,11 +71,15 @@ class InMemoryTraceManager:
             trace_id: The trace ID for the new trace.
             trace_info: The trace info object to be stored.
         """
+        import time
+        print("Register trace in test:", trace_id, time.time())
         # Check for a new timeout setting whenever a new trace is created.
         self._check_timeout_update()
         with self._lock:
             self._traces[trace_info.request_id] = _Trace(trace_info)
             self._trace_id_to_request_id[trace_id] = trace_info.request_id
+            print("traceregistered!!!!")
+            print(self._trace_id_to_request_id)
 
     def update_trace_info(self, trace_info: TraceInfo):
         """
@@ -96,6 +102,11 @@ class InMemoryTraceManager:
             span: The span to be stored.
         """
         print("Registeringspan")
+        import time
+        print("Register span in test:", span.request_id, time.time())
+        print(f"[register_span] request_id={span.request_id}")
+        print(f"[register_span] trace_cache keys={list(self._traces)}")
+
         if not isinstance(span, LiveSpan):
             print("NOT LIVE SPAN")
             _logger.debug(f"Invalid span object {type(span)} is passed. Skipping.")
@@ -147,6 +158,8 @@ class InMemoryTraceManager:
         """
         Get the request ID for the given trace ID.
         """
+        print(trace_id)
+        print(self._trace_id_to_request_id)
         return self._trace_id_to_request_id.get(trace_id)
 
     def set_request_metadata(self, request_id: str, key: str, value: str):
@@ -189,6 +202,8 @@ class InMemoryTraceManager:
     @classmethod
     def reset(self):
         """Clear all the aggregated trace data. This should only be used for testing."""
+        print("RESET called")
+
         if self._instance:
             with self._instance._lock:
                 self._instance._traces.clear()
