@@ -2,9 +2,12 @@ from mlflow.semantic_kernel.autolog import (
     _semantic_kernel_chat_completion_error_wrapper,
     _semantic_kernel_chat_completion_input_wrapper,
     _semantic_kernel_chat_completion_response_wrapper,
+    _semantic_kernel_invoke_trace_wrapper,
     _trace_wrapper,
     setup_semantic_kernel_tracing,
+
 )
+import mlflow
 from mlflow.utils.annotations import experimental
 from mlflow.utils.autologging_utils import autologging_integration, safe_patch
 
@@ -31,6 +34,8 @@ def autolog(
     """
 
     setup_semantic_kernel_tracing()
+
+    mlflow.openai.autolog(disable=True)
 
     from semantic_kernel.utils.telemetry.model_diagnostics import decorators
 
@@ -68,13 +73,25 @@ def autolog(
                 ],
             ),
             (EmbeddingGeneratorBase, ["generate_embeddings", "generate_raw_embeddings"]),
-            (Kernel, ["invoke", "invoke_stream", "invoke_prompt", "invoke_prompt_stream"]),
         ]
 
         for cls, methods in entry_point_patches:
             for method in methods:
                 if hasattr(cls, method):
                     safe_patch(FLAVOR_NAME, cls, method, _trace_wrapper)
+
+
+
+        entry_point_patches = [
+            (Kernel, ["invoke"])
+        ]
+
+        for cls, methods in entry_point_patches:
+            for method in methods:
+                if hasattr(cls, method):
+                    safe_patch(FLAVOR_NAME, cls, method, _semantic_kernel_invoke_trace_wrapper)
+
+        
 
     except ImportError:
         pass

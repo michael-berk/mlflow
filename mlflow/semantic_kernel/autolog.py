@@ -3,6 +3,7 @@ import logging
 import os
 from types import MappingProxyType
 from typing import Any, Optional
+from pydantic import BaseModel
 
 from opentelemetry.context import Context
 from opentelemetry.sdk.trace import ReadableSpan as OTelReadableSpan
@@ -39,9 +40,17 @@ from mlflow.tracing.constant import (
     SpanAttributeKey,
     TokenUsageKey,
 )
+from mlflow.tracing.fluent import start_span  # local import to avoid circular deps
 from mlflow.tracing.fluent import start_span_no_context
 from mlflow.tracing.provider import detach_span_from_context, set_span_in_context
 from mlflow.tracing.trace_manager import InMemoryTraceManager
+
+from mlflow.types.chat import (
+    ChatMessage,
+    Function,
+    TextContentPart,
+    ToolCall,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -114,10 +123,15 @@ class SemanticKernelSpanProcessor(SimpleSpanProcessor):
         parent_st = _OTEL_SPAN_ID_TO_MLFLOW_SPAN_AND_TOKEN.get(parent_span_id)
         parent_span = parent_st[0] if parent_st else None
 
+        # Convert MappingProxyType (immutable mapping) to dict to satisfy MLflow span API
+        attrs = span.attributes
+        if isinstance(attrs, MappingProxyType):
+            attrs = dict(attrs)
+
         mlflow_span = start_span_no_context(
             name=span.name,
             parent_span=parent_span,
-            attributes=span.attributes,
+            attributes=attrs,
         )
         token = set_span_in_context(mlflow_span)
         _OTEL_SPAN_ID_TO_MLFLOW_SPAN_AND_TOKEN[otel_span_id] = (mlflow_span, token)
@@ -277,8 +291,6 @@ def _semantic_kernel_chat_completion_response_wrapper(original, *args, **kwargs)
 
 
 async def _trace_wrapper(original, *args, **kwargs):
-    from mlflow.tracing.constant import SpanAttributeKey
-
     span = get_current_span()
     if span and span.is_recording():
         span.set_attribute(SpanAttributeKey.FUNCTION_NAME, original.__qualname__)
@@ -309,3 +321,283 @@ def _semantic_kernel_chat_completion_error_wrapper(original, *args, **kwargs) ->
         t.info.status = TraceStatus.ERROR
 
     return original(*args, **kwargs)
+
+
+async def _semantic_kernel_invoke_trace_wrapper(original, *args, **kwargs):
+    """Wrapper for Kernel.invoke / invoke_* methods.
+
+    1. Open an MLflow span (which in turn opens an OpenTelemetry span and makes it the
+       *current* span in the OTEL context).
+    2. Record function name, inputs, outputs, errors.
+    3. Because the span is put in the OTEL context, every span that Semantic Kernel
+       starts internally will automatically be a child of this span, ensuring a
+       well-formed trace tree.
+    """
+
+    # Create a new span – if another span is already active this will automatically
+    # become its child, otherwise it becomes the root of a new trace.
+    with start_span(name=f"{original.__qualname__}", span_type=SpanType.CHAIN) as span:
+        # Set up span context and record inputs
+        _setup_span_context(span, original, args, kwargs)
+        
+        # Execute the actual Semantic Kernel call
+        try:
+            result = await original(*args, **kwargs)
+            _record_span_outputs(span, result)
+            return result
+        except Exception as err:
+            _handle_span_error(span, err)
+            raise
+
+
+def _setup_span_context(span: LiveSpan, original, args, kwargs) -> None:
+    """Set up span context and record inputs."""
+    try:
+        inputs = _extract_inputs(args, kwargs)
+        span.set_attribute(SpanAttributeKey.INPUTS, inputs)
+        
+        # Set up OTel span mapping
+        token = set_span_in_context(span)
+        otel_span_id = getattr(span, "_span", None).get_span_context().span_id  # type: ignore[attr-defined]
+        _OTEL_SPAN_ID_TO_MLFLOW_SPAN_AND_TOKEN[otel_span_id] = (span, token)
+        
+    except Exception as e:
+        span.set_attribute(SpanAttributeKey.INPUTS, f"Failed to serialize inputs: {e!s}")
+
+
+def _extract_inputs(args, kwargs) -> dict:
+    """Extract and serialize inputs from function arguments."""
+    inputs = {}
+    
+    if "arguments" in kwargs:
+        inputs['arguments'] = kwargs['arguments']
+    
+    # Iterate through args tuple and serialize each argument
+    if args:
+        for i, arg in enumerate(args):
+            print(f"Processing arg {i}: {arg}")
+            # Try different serialization methods
+            if hasattr(arg, "dict"):
+                serialized_arg = arg.dict()
+            elif hasattr(arg, "model_dump"):
+                serialized_arg = arg.model_dump()
+            elif isinstance(arg, dict):
+                serialized_arg = arg
+            elif hasattr(arg, "items"):
+                serialized_arg = arg.items()
+            else:
+                serialized_arg = str(arg)
+            
+            print(f"Serialized arg {i}: {serialized_arg}")
+            
+            # Update inputs dict with serialized argument
+            if isinstance(serialized_arg, dict):
+                inputs.update(serialized_arg)
+            else:
+                inputs[f"arg{i}"] = serialized_arg
+
+    
+    return inputs
+
+
+def _record_span_outputs(span: LiveSpan, result) -> None:
+    """Record outputs and attributes from the function result."""
+    output_payload, extra_attrs = _extract_chat_and_attributes(result)
+
+    if output_payload:
+        span.set_outputs(output_payload)
+        # Set chat messages attribute for backwards compatibility
+        if "messages" in output_payload:
+            extra_attrs[SpanAttributeKey.CHAT_MESSAGES] = output_payload["messages"]
+    else:
+        # Fallback: log entire result as outputs
+        try:
+            from mlflow.tracing.utils import TraceJSONEncoder
+            span.set_outputs(json.dumps(result, cls=TraceJSONEncoder))
+        except Exception:
+            span.set_outputs(str(result))
+
+    # Attach remaining attributes
+    span.set_attributes(extra_attrs)
+
+
+def _handle_span_error(span: LiveSpan, error: Exception) -> None:
+    """Handle errors in span execution."""
+    span.set_attribute(SpanAttributeKey.OUTPUTS, f"Error: {error!s}")
+    span.set_status(SpanStatusCode.ERROR)
+    span.add_event(SpanEvent.from_exception(error))
+
+
+def _extract_chat_and_attributes(result: Any) -> tuple[Optional[dict], dict[str, Any]]:
+    """Parse the result returned by ``Kernel.invoke``.
+
+    Returns:
+        tuple: (output_payload, extra_attrs) where output_payload is ready for set_outputs
+               and extra_attrs contains additional span attributes.
+    """
+    try:
+        if hasattr(result, "function") and hasattr(result, "value"):
+            return _extract_function_result_data(result)
+        else:
+            return {"output": result}, {}
+    except Exception as err:
+        _logger.debug(
+            "Failed to extract chat / attributes from invoke result: %s", err, exc_info=True
+        )
+        return None, {"invoke_result": str(result)}
+
+
+def _extract_function_result_data(result) -> tuple[dict, dict[str, Any]]:
+    """Extract data from a Semantic Kernel FunctionResult object."""
+    output_payload: dict[str, Any] = {}
+    extra_attrs: dict[str, Any] = {}
+
+    # Extract function information
+    _extract_function_info(result, extra_attrs)
+    
+    # Extract rendered prompt
+    if rendered_prompt := getattr(result, "rendered_prompt", None):
+        output_payload["rendered_prompt"] = rendered_prompt
+
+    # Extract metadata and messages
+    if metadata := getattr(result, "metadata", None):
+        _extract_metadata_info(metadata, output_payload, extra_attrs)
+
+    # Extract chat messages from value
+    _extract_value_messages(result, output_payload)
+
+    return output_payload, extra_attrs
+
+
+def _extract_function_info(result, extra_attrs: dict) -> None:
+    """Extract function information into extra attributes."""
+    try:
+        fn_obj = getattr(result, "function", None)
+        if fn_obj is not None and hasattr(fn_obj, "dict"):
+            extra_attrs["function"] = fn_obj.dict()
+        else:
+            extra_attrs["function"] = str(fn_obj)
+    except Exception:
+        extra_attrs["function"] = str(getattr(result, "function", None))
+
+
+def _extract_metadata_info(metadata, output_payload: dict, extra_attrs: dict) -> None:
+    """Extract metadata information and any embedded messages."""
+    try:
+        meta_dict = metadata if isinstance(metadata, dict) else getattr(metadata, "__dict__", {})
+    except Exception:
+        meta_dict = {}
+
+    # Extract messages from metadata if present
+    if meta_dict and isinstance(meta_dict, dict):
+        sk_messages = meta_dict.get("messages")
+        if sk_messages and hasattr(sk_messages, "dict"):
+            sk_messages = sk_messages.dict().get("messages", [])
+            
+            if sk_messages:
+                chat_messages = _parse_message_list(sk_messages)
+                if chat_messages:
+                    _merge_messages_into_payload(chat_messages, output_payload)
+
+        # Store metadata (excluding large message objects) as attribute
+        reduced_meta = {k: v for k, v in meta_dict.items() if k != "messages"}
+        if reduced_meta:
+            extra_attrs["metadata"] = reduced_meta
+
+
+def _extract_value_messages(result, output_payload: dict) -> None:
+    """Extract chat messages from the result value."""
+    value = getattr(result, "value", None)
+    if value is None:
+        return
+
+    chat_messages = []
+    if isinstance(value, list):
+        for item in value:
+            if parsed_msg := _parse_message_like(item):
+                chat_messages.append(parsed_msg)
+    else:
+        if parsed_msg := _parse_message_like(value):
+            chat_messages.append(parsed_msg)
+
+    if chat_messages:
+        _merge_messages_into_payload(chat_messages, output_payload)
+    else:
+        # If we couldn't turn the value into messages, keep it as-is
+        output_payload["value"] = value
+
+
+def _parse_message_list(messages: list) -> list[ChatMessage]:
+    """Parse a list of message-like objects into ChatMessage objects."""
+    chat_messages = []
+    for msg in messages:
+        if parsed_msg := _parse_message_like(msg):
+            chat_messages.append(parsed_msg)
+    return chat_messages
+
+
+def _merge_messages_into_payload(chat_messages: list[ChatMessage], output_payload: dict) -> None:
+    """Merge chat messages into the output payload."""
+    chat_dicts = [m.model_dump_compat() for m in chat_messages]
+    if "messages" in output_payload:
+        output_payload["messages"].extend(chat_dicts)
+    else:
+        output_payload["messages"] = chat_dicts
+
+
+def _parse_message_like(message_like: Any) -> Optional[ChatMessage]:
+    """Parse a Semantic Kernel message-like object into MLflow ChatMessage format."""
+    try:
+        if isinstance(message_like, BaseModel):
+            message_like = message_like.model_dump()
+        
+        role_enum = message_like.get("role")
+        role = getattr(role_enum, "value", str(role_enum))  # handle AuthorRole enums or strings
+
+        content_parts = []
+        refusal = None
+        tool_calls = []
+        tool_result = None
+        tool_call_id = None
+
+        for item in message_like.get("items", []):
+            item_type = item.get("content_type")
+
+            if item_type == "text":
+                content_parts.append(TextContentPart(type="text", text=item.get("text", "")))
+            elif item_type == "refusal":
+                refusal = item.get("refusal")
+            elif item_type == "function_call":
+                tool_calls.append(
+                    ToolCall(
+                        id=item.get("id"),
+                        function=Function(
+                            name=item.get("function_name"),
+                            arguments=item.get("arguments"),
+                        ),
+                    )
+                )
+            elif item_type == "function_result":
+                tool_result = item.get("result")
+                tool_call_id = item.get("id")
+            else:
+                _logger.debug(f"Unknown item content_type: {item_type} in item: {item}")
+
+        return _create_chat_message(role, content_parts, refusal, tool_calls, tool_result, tool_call_id)
+    
+    except Exception as e:
+        _logger.debug(f"Failed to parse message-like object: {e}")
+        return None
+
+
+def _create_chat_message(role: str, content_parts: list, refusal: Optional[str], 
+                        tool_calls: list, tool_result: Optional[str], 
+                        tool_call_id: Optional[str]) -> ChatMessage:
+    """Create a ChatMessage based on the parsed components."""
+    if tool_calls:
+        return ChatMessage(role=role, content="", tool_calls=tool_calls)
+    elif tool_result is not None:
+        return ChatMessage(role=role, content=tool_result, tool_call_id=tool_call_id)
+    else:
+        return ChatMessage(role=role, content=content_parts, refusal=refusal)
+
