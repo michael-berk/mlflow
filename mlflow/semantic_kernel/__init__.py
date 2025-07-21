@@ -48,6 +48,7 @@ def autolog(
             TextCompletionClientBase,
         )
         from semantic_kernel.kernel import Kernel
+        from semantic_kernel.functions import KernelFunction
 
         entry_point_patches = [
             (
@@ -73,6 +74,7 @@ def autolog(
                 ],
             ),
             (EmbeddingGeneratorBase, ["generate_embeddings", "generate_raw_embeddings"]),
+            (KernelFunction, ["invoke"]),
         ]
 
         for cls, methods in entry_point_patches:
@@ -83,7 +85,8 @@ def autolog(
 
 
         entry_point_patches = [
-            (Kernel, ["invoke"])
+            (Kernel, ["invoke"]),
+
         ]
 
         for cls, methods in entry_point_patches:

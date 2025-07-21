@@ -205,6 +205,7 @@ def _get_span_type(span: OTelSpan) -> str:
             CHAT_STREAMING_COMPLETION_OPERATION: SpanType.CHAT_MODEL,
             TEXT_COMPLETION_OPERATION: SpanType.LLM,
             TEXT_STREAMING_COMPLETION_OPERATION: SpanType.LLM,
+            "execute_tool": SpanType.TOOL,
         }
         span_type = span_map.get(operation)
 
@@ -241,7 +242,7 @@ def _semantic_kernel_chat_completion_input_wrapper(original, *args, **kwargs) ->
 
         if mlflow_span := _get_live_span_from_otel_span_id(otel_span_id):
             mlflow_span.set_span_type(SpanType.CHAT_MODEL)
-            mlflow_span.set_inputs(json.dumps(prompt_value_with_message))
+            mlflow_span.set_inputs(prompt_value_with_message)
         else:
             _logger.debug(
                 "Span is not found or recording. Skipping registering chat "
@@ -283,8 +284,8 @@ def _semantic_kernel_chat_completion_response_wrapper(original, *args, **kwargs)
 
                 full_responses.append(full_response)
 
-            mlflow_span.set_outputs(json.dumps(full_responses))
-            mlflow_span.set_attribute(SpanAttributeKey.CHAT_MESSAGES, json.dumps(full_responses))
+            mlflow_span.set_outputs(full_responses)
+            mlflow_span.set_attribute(SpanAttributeKey.CHAT_MESSAGES, full_responses)
 
     except Exception as e:
         _logger.warning(f"Failed to set outputs attribute: {e}")
@@ -293,13 +294,51 @@ def _semantic_kernel_chat_completion_response_wrapper(original, *args, **kwargs)
 async def _trace_wrapper(original, *args, **kwargs):
     span = get_current_span()
     if span and span.is_recording():
-        span.set_attribute(SpanAttributeKey.FUNCTION_NAME, original.__qualname__)
-        span.set_attribute(SpanAttributeKey.INPUTS, str(args))
+
+        otel_span_id = get_current_span().get_span_context().span_id
+        mlflow_span = _get_live_span_from_otel_span_id(otel_span_id)
+
+        inputs = _extract_inputs(args, kwargs)
+
+        print("MLFLOW SPAN", mlflow_span)
+        
+        # Check if span already has inputs and append to them if present
+        if mlflow_span and inputs:
+            existing_inputs = getattr(mlflow_span, '_inputs', None)
+            if existing_inputs:
+                try:
+                    # Parse existing inputs if they're in JSON format
+                    if isinstance(existing_inputs, str):
+                        existing_data = json.loads(existing_inputs)
+                    else:
+                        existing_data = existing_inputs
+                    
+                    # Merge existing and new inputs
+                    if isinstance(existing_data, dict) and isinstance(inputs, dict):
+                        merged_inputs = {**existing_data, **inputs}
+                        mlflow_span.set_inputs(merged_inputs)
+                    else:
+                        mlflow_span.set_inputs(inputs)
+                except (json.JSONDecodeError, TypeError):
+                    # If we can't parse existing inputs, just set new ones
+                    mlflow_span.set_inputs(inputs)
+            else:
+                mlflow_span.set_inputs(inputs)
+            
+            mlflow_span.set_attribute(SpanAttributeKey.FUNCTION_NAME, original.__qualname__)
+            # print(f"Setting  {original.__qualname__} inputs:", inputs)
 
     try:
         result = await original(*args, **kwargs)
         if span and span.is_recording():
-            span.set_attribute(SpanAttributeKey.OUTPUTS, _serialize_semantic_kernel_result(result))
+            output_payload ={}
+            otel_span_id = get_current_span().get_span_context().span_id
+            mlflow_span = _get_live_span_from_otel_span_id(otel_span_id)
+            print("result: ",result)
+                # Extract chat messages from value
+            output_payload, extra_attrs = _extract_chat_and_attributes(result)
+            print("output payload: ",output_payload)
+            mlflow_span.set_outputs(output_payload)
         return result
     except Exception as e:
         if span and span.is_recording():
@@ -369,13 +408,10 @@ def _extract_inputs(args, kwargs) -> dict:
     """Extract and serialize inputs from function arguments."""
     inputs = {}
     
-    if "arguments" in kwargs:
-        inputs['arguments'] = kwargs['arguments']
-    
     # Iterate through args tuple and serialize each argument
     if args:
         for i, arg in enumerate(args):
-            print(f"Processing arg {i}: {arg}")
+            # print(f"Processing arg {i}: {arg}")
             # Try different serialization methods
             if hasattr(arg, "dict"):
                 serialized_arg = arg.dict()
@@ -388,7 +424,7 @@ def _extract_inputs(args, kwargs) -> dict:
             else:
                 serialized_arg = str(arg)
             
-            print(f"Serialized arg {i}: {serialized_arg}")
+            # print(f"Serialized arg {i}: {serialized_arg}")
             
             # Update inputs dict with serialized argument
             if isinstance(serialized_arg, dict):
@@ -396,6 +432,35 @@ def _extract_inputs(args, kwargs) -> dict:
             else:
                 inputs[f"arg{i}"] = serialized_arg
 
+    # Iterate through kwargs dictionary and serialize each value
+    if kwargs:
+        for key, value in kwargs.items():
+            if key not in ['user_input','chat_history', "argument"]:
+                continue
+            # print(f"Processing kwarg {key}: {value}")
+            # Try different serialization methods
+            if hasattr(value, "dict"):
+                serialized_value = value.dict()
+            elif hasattr(value, "model_dump"):
+                serialized_value = value.model_dump()
+            elif isinstance(value, dict):
+                serialized_value = value
+            elif hasattr(value, "items"):
+                serialized_value = value.items()
+            else:
+                serialized_value = str(value)
+            
+            # print(f"Serialized kwarg {key}: {serialized_value}")
+            
+            # Update inputs dict with serialized value
+            if isinstance(serialized_value, dict):
+                # For dict values, we could either update directly or nest under the key
+                # Nesting under the key preserves the parameter name
+                inputs.update(serialized_value)
+            else:
+                inputs[key] = serialized_value
+
+        # print("Inputs :",inputs)        
     
     return inputs
 
